@@ -2,22 +2,12 @@
 This is a layer build on top of Cyclone
 """
 from collections import OrderedDict
-
-from gemstone.common.core import Core
-from gemstone.common.mux_with_default import MuxWithDefaultWrapper
-from gemstone.common.zext_wrapper import ZextWrapper
-from gemstone.common.configurable import Configurable, ConfigurationType
+from kratos import Generator, zext, PortDirection, PortType, PackedStruct
+from zelus import Mux, MuxDefault, ConfigRegister, Register
 from .cyclone import Node, PortNode, Tile, SwitchBoxNode, SwitchBoxIO, \
     SwitchBox, InterconnectCore, RegisterNode, RegisterMuxNode
-import mantle
-from gemstone.common.mux_wrapper import MuxWrapper
-import magma
+
 from typing import Dict, Tuple, List
-from abc import abstractmethod
-import gemstone.generator.generator as generator
-from gemstone.generator.from_magma import FromMagma
-from mantle import DefineRegister
-from gemstone.generator.const import Const
 
 
 def create_name(name: str):
@@ -45,38 +35,98 @@ def create_mux(node: Node):
             name = node_name
     else:
         name = f"WIRE_{node_name}"
-    mux = MuxWrapper(height, node.width, name=name)
-    return mux
+    mux = Mux.create(height=height, width=node.width)
+    return mux, name
 
 
-class InterconnectConfigurable(Configurable):
-    pass
+class InterconnectConfigurable(Generator):
+    def __init__(self, name, config_addr_width, config_data_width,
+                 is_clone=False):
+        super().__init__(name, is_clone=is_clone)
+
+        self.registers: Dict[ConfigRegister] = {}
+
+        self.config_addr_width = config_addr_width
+        self.config_data_width = config_data_width
+
+        self.read_config_data_mux: Mux
+
+        # Ports for reconfiguration.
+        self.port("clk", 1, PortDirection.In, PortType.Clock)
+        self.port("reset", 1, PortDirection.In, PortType.AsyncReset)
+        self.port("read_config_data", config_data_width, PortDirection.Out)
+
+    def add_config(self, name, width):
+        assert name not in self.registers
+        reg = ConfigRegister.create(width=width,
+                                    addr_width=self.config_addr_width,
+                                    data_width=self.config_data_width,
+                                    use_config_en=True)
+        self.add_child_generator(name, reg)
+        self.registers[name] = reg
+
+    def _setup_config(self):
+        config_names = list(self.registers.keys())
+        config_names.sort()
+        for idx, config_name in enumerate(config_names):
+            reg: ConfigRegister = self.registers[config_name]
+            reg.params.addr.set_value(idx)
+            self.wire(self.ports.config["config_addr"], reg.ports.config_addr)
+            self.wire(self.ports.config["config_data"], reg.ports.config_data)
+            self.wire(self.ports.config["write"], reg.ports.config_en)
+            self.wire(self.ports.reset, reg.ports.reset)
+
+        num_config_reg = len(config_names)
+        if num_config_reg > 1:
+            self.read_config_data_mux = Mux.create(height=num_config_reg,
+                                                   width=self.config_data_width)
+            sel_bits = self.read_config_data_mux.sel_size
+            # Wire up config_addr to select input of read_data MUX.
+            self.wire(self.ports.config["config_addr"][:sel_bits],
+                      self.read_config_data_mux.ports.S)
+            self.wire(self.read_config_data_mux.ports.O,
+                      self.ports.read_config_data)
+
+            for idx, config_name in enumerate(config_names):
+                reg = self.registers[config_name]
+                self.wire(self.read_config_data_mux.ports[f"I{idx}"],
+                          zext(reg.ports.O, self.config_data_width))
+        elif num_config_reg == 1:
+            config_name = config_names[0]
+            reg = self.registers[config_name]
+            self.wire(self.ports.read_config_data,
+                      zext(reg.ports.O, self.config_data_width))
+
+
+ConfigurationType = PackedStruct("Config", [("config_addr", 32, False),
+                                            ("config_data", 32, False),
+                                            ("read", 1, False),
+                                            ("write", 1, False)])
 
 
 class CB(InterconnectConfigurable):
     def __init__(self, node: PortNode,
-                 config_addr_width: int, config_data_width: int):
+                 config_addr_width: int, config_data_width: int,
+                 is_clone=False):
         if not isinstance(node, PortNode):
             raise ValueError(node, PortNode.__name__)
         self.node: PortNode = node
 
-        super().__init__(config_addr_width, config_data_width)
+        super().__init__(create_name(str(self.node)), config_addr_width,
+                         config_data_width, is_clone=is_clone)
 
-        self.mux = create_mux(self.node)
+        self.mux, name = create_mux(self.node)
+        self.add_child_generator(name, self.mux)
 
         # lift the port to the top level
-        self.add_ports(
-            I=self.mux.ports.I.base_type(),
-            O=self.mux.ports.O.base_type())
+        self.port("I", node.width, PortDirection.In)
+        self.port("O", node.width, PortDirection.Out)
 
         self.wire(self.ports.I, self.mux.ports.I)
         self.wire(self.ports.O, self.mux.ports.O)
 
         if self.mux.height > 1:
-            self.add_ports(
-                config=magma.In(ConfigurationType(config_addr_width,
-                                                  config_data_width)),
-            )
+            self.port_packed("config", PortDirection.In, ConfigurationType)
             config_name = get_mux_sel_name(self.node)
             self.add_config(config_name, self.mux.sel_bits)
             self.wire(self.registers[config_name].ports.O,
@@ -84,36 +134,29 @@ class CB(InterconnectConfigurable):
         else:
             # remove clk and reset ports from the base class since it's going
             # to be a pass through wire anyway
-            self.ports.pop("clk")
-            self.ports.pop("reset")
-            self.ports.pop("read_config_data")
+            self.remove_port("clk")
+            self.remove_port("reset")
+            self.remove_port("read_config_data")
 
         self._setup_config()
-
-        self.instance_name = self.name()
-
-    def name(self):
-        return create_name(str(self.node))
 
 
 class SB(InterconnectConfigurable):
     def __init__(self, switchbox: SwitchBox, config_addr_width: int,
                  config_data_width: int, core_name: str = "",
-                 stall_signal_width: int = 4):
+                 stall_signal_width: int = 4, is_clone=False):
         self.switchbox = switchbox
         self.__core_name = core_name
         self.stall_signal_width = stall_signal_width
 
-        self.sb_muxs: Dict[str, Tuple[SwitchBoxNode, MuxWrapper]] = {}
-        self.reg_muxs: Dict[str, Tuple[RegisterMuxNode, MuxWrapper]] = {}
-        self.regs: Dict[str, Tuple[RegisterNode, FromMagma]] = {}
+        self.sb_muxs: Dict[str, Tuple[SwitchBoxNode, Mux]] = {}
+        self.reg_muxs: Dict[str, Tuple[RegisterMuxNode, Mux]] = {}
+        self.regs: Dict[str, Tuple[RegisterNode, Register]] = {}
 
         self.mux_name_to_node: Dict[str:, Node] = {}
 
-        super().__init__(config_addr_width, config_data_width)
-
-        # turn off hashing because we control the hash by ourselves
-        self.set_skip_hash(True)
+        super().__init__(self.__name(), config_addr_width, config_data_width,
+                         is_clone=is_clone)
 
         # first pass to create the mux and register circuit
         self.__create_reg()
@@ -125,7 +168,7 @@ class SB(InterconnectConfigurable):
             # only lift them if the ports are connect to the outside world
             port_name = create_name(sb_name)
             if sb.io == SwitchBoxIO.SB_IN:
-                self.add_port(port_name, magma.In(mux.ports.I.base_type()))
+                self.port(port_name, magma.In(mux.ports.I.base_type()))
                 self.wire(self.ports[port_name], mux.ports.I)
 
             else:
@@ -154,15 +197,12 @@ class SB(InterconnectConfigurable):
 
         # set up the configuration registers, if needed
         if len(self.sb_muxs) > 0:
-            self.add_ports(
-                config=magma.In(ConfigurationType(config_addr_width,
-                                                  config_data_width)),
-            )
+            self.port_packed("config", PortDirection.In, ConfigurationType)
         else:
             # remove added ports since it's a empty switchbox
-            self.ports.pop("clk")
-            self.ports.pop("reset")
-            self.ports.pop("read_config_data")
+            self.remove_port("clk")
+            self.remove_port("reset")
+            self.remove_port("read_config_data")
 
         for _, (sb, mux) in self.sb_muxs.items():
             config_name = get_mux_sel_name(sb)
@@ -180,19 +220,6 @@ class SB(InterconnectConfigurable):
             self.wire(self.registers[config_name].ports.O,
                       mux.ports.S)
         self._setup_config()
-
-        # name
-        self.instance_name = self.name()
-
-        # extra hashing because we don't represent it in the module name
-        _hash = hash(self)
-        # ordering doesn't mater here
-        for reg_name in self.regs:
-            _hash ^= hash(reg_name)
-        # also hash the internal wires based on switch box id
-        _hash ^= hash(switchbox.id)
-        self.set_hash(_hash)
-        self.set_skip_hash(False)
 
     def add_config_node(self, node: Node, name, width):
         super().add_config(name, width)
@@ -231,41 +258,22 @@ class SB(InterconnectConfigurable):
 
     def __create_reg(self):
         for reg_name, reg_node in self.switchbox.registers.items():
-            reg_cls = DefineRegister(reg_node.width, has_ce=True)
-            reg = FromMagma(reg_cls)
-            reg.instance_name = create_name(str(reg_node))
+            reg = Register.create(width=reg_node.width)
+            instance_name = create_name(str(reg_node))
+            self.add_child_generator(instance_name, reg)
             self.regs[reg_name] = reg_node, reg
         # add stall ports
         if len(self.regs) > 0:
-            self.add_port("stall",
-                          magma.In(magma.Bits[self.stall_signal_width]))
+            self.port("stall", self.stall_signal_width, PortDirection.In)
             # fanout the stall signals to registers
             # invert the stall signal to clk_en
-            invert = FromMagma(mantle.DefineInvert(1))
-            # FIXME: use the low bits of stall signal to stall
-            self.wire(invert.ports.I[0], self.ports.stall[0])
+            invert_sig = ~self.ports.stall[0]
             for (_, reg) in self.regs.values():
-                self.wire(reg.ports.CE, invert.ports.O[0])
+                self.wire(reg.ports.clk_en, invert_sig)
 
-    def __get_connected_port_names(self) -> List[str]:
-        # this is to uniquify the SB given different port connections
-        result = set()
-        for sb in self.switchbox.get_all_sbs():
-            nodes = sb.get_conn_in()[:]
-            nodes += list(sb)
-            for node in nodes:
-                if isinstance(node, PortNode) and node.x == self.switchbox.x \
-                        and node.y == self.switchbox.y \
-                        and len(node.get_conn_in()) == 0:
-                    result.add(node.name)
-        # make it deterministic
-        result = list(result)
-        result.sort()
-        return result
-
-    def name(self):
+    def __name(self):
         return f"SB_ID{self.switchbox.id}_{self.switchbox.num_track}TRACKS_" \
-            f"B{self.switchbox.width}_{self.__core_name}"
+               f"B{self.switchbox.width}_{self.__core_name}"
 
     def __connect_sbs(self):
         # the principle is that it only connects to the nodes within
@@ -331,6 +339,7 @@ class TileCircuit(generator.Generator):
     We don't deal with stall signal here since it's not interconnect's job
     to handle that signal
     """
+
     def __init__(self, tiles: Dict[int, Tile],
                  config_addr_width: int, config_data_width: int,
                  tile_id_width: int = 16,
@@ -673,9 +682,9 @@ class TileCircuit(generator.Generator):
     def get_route_bitstream_config(self, src_node: Node, dst_node: Node):
         assert src_node.width == dst_node.width
         tile = self.tiles[src_node.width]
-        assert dst_node.x == tile.x and dst_node.y == tile.y,\
+        assert dst_node.x == tile.x and dst_node.y == tile.y, \
             f"{dst_node} is not in {tile}"
-        assert dst_node in src_node,\
+        assert dst_node in src_node, \
             f"{dst_node} is not connected to {src_node}"
 
         config_data = dst_node.get_conn_in().index(src_node)
