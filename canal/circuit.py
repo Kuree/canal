@@ -3,7 +3,7 @@ This is a layer build on top of Cyclone
 """
 from collections import OrderedDict
 from kratos import Generator, zext, PortDirection, PortType, PackedStruct
-from zelus import Mux, MuxDefault, ConfigRegister, Register
+from zelus import MuxA as Mux, MuxDefault, ConfigRegister, Register
 from .cyclone import Node, PortNode, Tile, SwitchBoxNode, SwitchBoxIO, \
     SwitchBox, InterconnectCore, RegisterNode, RegisterMuxNode
 
@@ -44,7 +44,7 @@ class InterconnectConfigurable(Generator):
                  is_clone=False):
         super().__init__(name, is_clone=is_clone)
 
-        self.registers: Dict[ConfigRegister] = {}
+        self.registers: Dict[str, ConfigRegister] = {}
 
         self.config_addr_width = config_addr_width
         self.config_data_width = config_data_width
@@ -168,11 +168,11 @@ class SB(InterconnectConfigurable):
             # only lift them if the ports are connect to the outside world
             port_name = create_name(sb_name)
             if sb.io == SwitchBoxIO.SB_IN:
-                self.port(port_name, magma.In(mux.ports.I.base_type()))
+                self.input(port_name, mux.ports.I.width, size=mux.ports.I.size)
                 self.wire(self.ports[port_name], mux.ports.I)
 
             else:
-                self.add_port(port_name, magma.Out(mux.ports.O.base_type()))
+                self.output(port_name, mux.ports.O.width, mux.ports.O.size)
 
                 # to see if we have a register mux here
                 # if so , we need to lift the reg_mux output instead
@@ -207,16 +207,16 @@ class SB(InterconnectConfigurable):
         for _, (sb, mux) in self.sb_muxs.items():
             config_name = get_mux_sel_name(sb)
             if mux.height > 1:
-                assert mux.sel_bits > 0
-                self.add_config_node(sb, config_name, mux.sel_bits)
+                assert mux.sel_size > 0
+                self.add_config_node(sb, config_name, mux.sel_size)
                 self.wire(self.registers[config_name].ports.O,
                           mux.ports.S)
 
         for _, (reg_mux, mux) in self.reg_muxs.items():
             config_name = get_mux_sel_name(reg_mux)
             assert mux.height == 2
-            assert mux.sel_bits > 0
-            self.add_config_node(reg_mux, config_name, mux.sel_bits)
+            assert mux.sel_size > 0
+            self.add_config_node(reg_mux, config_name, mux.sel_size)
             self.wire(self.registers[config_name].ports.O,
                       mux.ports.S)
         self._setup_config()
@@ -254,7 +254,9 @@ class SB(InterconnectConfigurable):
             # we use the sb_name instead so that when we lift the port up,
             # we can use the mux output instead
             sb_name = str(sb_node)
-            self.reg_muxs[sb_name] = (reg_mux, create_mux(reg_mux))
+            mux, mux_name = create_mux(reg_mux)
+            self.add_child_generator(mux_name, mux)
+            self.reg_muxs[sb_name] = reg_mux, mux
 
     def __create_reg(self):
         for reg_name, reg_node in self.switchbox.registers.items():
@@ -331,7 +333,7 @@ class SB(InterconnectConfigurable):
             self.wire(reg.ports.O, mux.ports.I[idx])
 
 
-class TileCircuit(generator.Generator):
+class TileCircuit(Generator):
     """We merge tiles at the same coordinates with different bit widths
     The only requirements is that the tiles have to be on the same
     coordinates. Their heights do not have to match.
@@ -344,11 +346,7 @@ class TileCircuit(generator.Generator):
                  config_addr_width: int, config_data_width: int,
                  tile_id_width: int = 16,
                  full_config_addr_width: int = 32,
-                 stall_signal_width: int = 4):
-        super().__init__()
-
-        # turn off hashing because we controls that hashing here
-        self.set_skip_hash(True)
+                 stall_signal_width: int = 4, is_clone: bool = False):
 
         self.tiles = tiles
         self.config_addr_width = config_addr_width
@@ -391,6 +389,9 @@ class TileCircuit(generator.Generator):
         self.core = core.core
         self.core_interface = core
 
+        # good to go
+        super().__init__(self.__name(), is_clone=is_clone)
+
         # create cb and switchbox
         self.cbs: Dict[str, CB] = {}
         self.sbs: Dict[int, SB] = {}
@@ -407,8 +408,12 @@ class TileCircuit(generator.Generator):
                     if len(port_node.get_conn_in()) == 0:
                         continue
                     # create a CB
-                    port_ref = core.get_port_ref(port_node.name)
-                    cb = CB(port_node, config_addr_width, config_data_width)
+                    port_name = port_node.name
+                    cb = CB.create(node=port_node,
+                                   config_addr_width=config_addr_width,
+                                   config_data_width=config_data_width)
+                    self.add_child_generator(f"CB_{port_name}", cb)
+                    port_ref = core.get_port_ref(port_name)
                     self.wire(cb.ports.O, port_ref)
                     self.cbs[port_name] = cb
                 else:
@@ -418,9 +423,13 @@ class TileCircuit(generator.Generator):
 
             # switch box time
             core_name = self.core.name() if self.core is not None else ""
-            sb = SB(tile.switchbox, config_addr_width, config_data_width,
-                    core_name, stall_signal_width=stall_signal_width)
+            sb = SB.create(switchbox=tile.switchbox,
+                           config_addr_width=config_addr_width,
+                           config_data_width=config_data_width,
+                           core_name=core_name,
+                           stall_signal_width=stall_signal_width)
             self.sbs[sb.switchbox.width] = sb
+            self.add_child_generator(f"SB_{bit_width}", sb)
 
         # lift all the sb ports up
         for _, switchbox in self.sbs.items():
@@ -435,14 +444,9 @@ class TileCircuit(generator.Generator):
                 assert sb.y == self.y
                 port = switchbox.ports[sb_name]
                 if node.io == SwitchBoxIO.SB_IN:
-                    self.add_port(sb_name, magma.In(port.base_type()))
-                    # FIXME:
-                    #   it seems like I need this hack to by-pass coreIR's
-                    #   checking, even though it's connected below
-                    self.wire(self.ports[sb_name], mux.ports.I)
+                    self.input(sb_name, width=port.width, size=port.size)
                 else:
-                    self.add_port(sb_name, magma.Out(port.base_type()))
-                assert port.owner() == switchbox
+                    self.output(sb_name, width=port.width, size=port.size)
                 self.wire(self.ports[sb_name], port)
 
         # connect ports from cb to switch box and back
@@ -739,7 +743,7 @@ class TileCircuit(generator.Generator):
         mux_sel_name = get_mux_sel_name(node)
         return config_names.index(mux_sel_name)
 
-    def name(self):
+    def __name(self):
         if self.core is not None:
             return f"Tile_{self.core.name()}"
         else:

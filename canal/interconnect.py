@@ -4,11 +4,9 @@ import os
 from .cyclone import InterconnectGraph, SwitchBoxSide, Node
 from .cyclone import Tile, SwitchBoxNode, SwitchBoxIO, RegisterMuxNode
 from typing import Dict, Tuple, List
-import gemstone.generator.generator as generator
 from .circuit import TileCircuit, create_name
-from gemstone.common.configurable import ConfigurationType
-from gemstone.common.core import PnRTag, ConfigurableCore
-from gemstone.generator.const import Const
+from .circuit import ConfigurationType
+from kratos import Generator
 import enum
 
 
@@ -18,13 +16,13 @@ class GlobalSignalWiring(enum.Enum):
     Meso = enum.auto()
 
 
-class Interconnect(generator.Generator):
+class Interconnect(Generator):
     def __init__(self, interconnects: Dict[int, InterconnectGraph],
                  config_addr_width: int, config_data_width: int,
                  tile_id_width: int,
                  stall_signal_width: int = 4,
                  lift_ports=False):
-        super().__init__()
+        super().__init__("Interconnect")
 
         self.__interface = {}
 
@@ -170,7 +168,6 @@ class Interconnect(generator.Generator):
                (feat_addr << tile.tile_id_width)
         addr = addr | tile_id
         return addr
-
 
     def __lift_ports(self):
         # we assume it's a rectangular grid
